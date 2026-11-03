@@ -5,7 +5,6 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             page { ModelsSettingsView() }.tabItem { Label("模型服务", systemImage: "cpu") }
-            page { InputSettingsView() }.tabItem { Label("输入", systemImage: "keyboard") }
             page { PermissionsSettingsView() }.tabItem { Label("权限", systemImage: "lock.shield") }
         }
         .frame(width: 620, height: 520)
@@ -23,10 +22,6 @@ struct SettingsView: View {
     }
 }
 
-private func inkSwitch(_ title: String, isOn: Binding<Bool>) -> some View {
-    Toggle(title, isOn: isOn).toggleStyle(.switch).controlSize(.small).labelsHidden()
-}
-
 // MARK: - 模型服务
 
 struct ModelsSettingsView: View {
@@ -36,25 +31,14 @@ struct ModelsSettingsView: View {
     var body: some View {
         Group {
             SettingsGroup(title: "语音识别") {
-                addMenu([("OpenRouter（Whisper Large V3 Turbo）", ModelProfile.openRouterWhisper),
-                         ("OpenAI 兼容接口（Groq、OpenAI 等）", ModelProfile.openAICompatibleTranscription)])
+                Button { editing = ModelProfile.newTranscription() } label: {
+                    Label("添加", systemImage: "plus").font(.ui(TypeScale.code))
+                }
+                .buttonStyle(.borderless).foregroundStyle(Palette.textSecondary)
             } content: {
                 SettingsList {
                     SettingsRow(title: "当前使用") { activePicker($store.activeTranscriptionID, role: .transcription) }
                     ForEach(store.profiles(for: .transcription)) { RowDivider(); row($0) }
-                }
-            }
-
-            SettingsGroup(title: "文字润色") {
-                addMenu([("OpenRouter / OpenAI 兼容对话模型", ModelProfile.openRouterPolish)])
-            } content: {
-                SettingsList {
-                    SettingsRow(title: "松手后润色") { inkSwitch("松手后润色", isOn: $store.polishEnabled) }
-                    RowDivider()
-                    SettingsRow(title: "当前使用") {
-                        activePicker($store.activePolishID, role: .polish).disabled(!store.polishEnabled)
-                    }
-                    ForEach(store.profiles(for: .polish)) { RowDivider(); row($0) }
                 }
             }
         }
@@ -69,18 +53,6 @@ struct ModelsSettingsView: View {
             ForEach(store.profiles(for: role)) { Text($0.name).tag(UUID?.some($0.id)) }
         }
         .pickerStyle(.menu).labelsHidden().fixedSize()
-    }
-
-    private func addMenu(_ templates: [(String, () -> ModelProfile)]) -> some View {
-        Menu {
-            ForEach(templates.indices, id: \.self) { index in
-                Button(templates[index].0) { editing = templates[index].1() }
-            }
-        } label: {
-            Label("添加", systemImage: "plus").font(.ui(TypeScale.code))
-        }
-        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-        .foregroundStyle(Palette.textSecondary)
     }
 
     private func row(_ profile: ModelProfile) -> some View {
@@ -107,13 +79,13 @@ struct ModelsSettingsView: View {
 
 // MARK: - 编辑单个模型
 
+/// 用户只填写：名称、Base URL、API Key、模型 ID。
+/// 接口格式、超时、语言、零数据保留等由程序自动处理；点"保存"时会先在后台验证一次连接。
 struct ModelEditorView: View {
-    private enum Outcome { case success(String), failure(String) }
-
     @State private var draft: ModelProfile
     @State private var apiKey: String
-    @State private var testResult: Outcome?
-    @State private var testing = false
+    @State private var saving = false
+    @State private var saveError: String?
     @State private var remoteModels: [RemoteModel] = []
     @State private var fetching = false
     @State private var fetchError: String?
@@ -126,103 +98,89 @@ struct ModelEditorView: View {
         self.onClose = onClose
     }
 
+    private var trimmedKey: String { apiKey.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    private var canSave: Bool {
+        !draft.name.trimmingCharacters(in: .whitespaces).isEmpty
+            && !draft.baseURL.trimmingCharacters(in: .whitespaces).isEmpty
+            && !trimmedKey.isEmpty
+            && !draft.model.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: Space.md) {
-                    TokenTextField(label: "名称", text: $draft.name)
-                    Field(label: "接口格式") {
-                        Picker("接口格式", selection: $draft.format) {
-                            ForEach(APIFormat.formats(for: draft.role)) { Text($0.displayName).tag($0) }
-                        }
-                        .pickerStyle(.menu).labelsHidden().fixedSize()
-                    }
-                    TokenTextField(label: "Base URL", text: $draft.baseURL, prompt: "https://openrouter.ai/api/v1")
-                    TokenTextField(label: "API Key", text: $apiKey, secure: true)
-                    HStack(alignment: .bottom, spacing: Space.sm) {
-                        TokenTextField(label: "模型 ID", text: $draft.model,
-                                       prompt: draft.role == .transcription ? "openai/whisper-large-v3-turbo" : "provider/model-name")
-                        Button { fetchModels() } label: {
-                            HStack(spacing: 7) {
-                                if fetching { TokenSpinner() }
-                                Text("选择模型")
-                            }
-                        }
-                        .buttonStyle(SecondaryButtonStyle(size: .field))
-                        .disabled(fetching || draft.baseURL.isEmpty)
-                        .popover(isPresented: $showPicker, arrowEdge: .bottom) {
-                            ModelPickerView(models: remoteModels, role: draft.role, current: draft.model) { choose($0) }
+            VStack(alignment: .leading, spacing: Space.md) {
+                TokenTextField(label: "名称", text: $draft.name, prompt: "例如：OpenRouter Whisper")
+                TokenTextField(label: "Base URL", text: $draft.baseURL, prompt: "https://openrouter.ai/api/v1")
+                TokenTextField(label: "API Key", text: $apiKey, secure: true)
+                HStack(alignment: .bottom, spacing: Space.sm) {
+                    TokenTextField(label: "模型 ID", text: $draft.model, prompt: "openai/whisper-large-v3-turbo")
+                    Button { fetchModels() } label: {
+                        HStack(spacing: 7) {
+                            if fetching { TokenSpinner() }
+                            Text("选择模型")
                         }
                     }
-                    if let fetchError {
-                        Text(fetchError).font(.ui(TypeScale.caption)).foregroundStyle(Palette.danger)
-                    }
-                    if draft.role == .transcription {
-                        TokenTextField(label: "语言", text: $draft.language, prompt: "留空自动检测")
-                    }
-                    Field(label: "Temperature") {
-                        HStack(spacing: Space.md) {
-                            Slider(value: $draft.temperature, in: 0...1, step: 0.1)
-                            Text(String(format: "%.1f", draft.temperature))
-                                .font(.mono(TypeScale.code)).foregroundStyle(Palette.textSecondary).frame(width: 28)
-                        }
-                    }
-                    Field(label: "超时") {
-                        Stepper(value: $draft.timeout, in: 1...60) {
-                            Text("\(Int(draft.timeout)) 秒").font(.mono(TypeScale.code))
-                        }
-                    }
-                    if draft.format == .openRouterTranscription || draft.baseURL.contains("openrouter.ai") {
-                        HStack {
-                            Text("零数据保留（ZDR）").textStyle(TypeScale.meta, .regular, color: Palette.textSecondary)
-                            Spacer()
-                            inkSwitch("零数据保留（ZDR）", isOn: $draft.zeroDataRetention)
-                        }
+                    .buttonStyle(SecondaryButtonStyle(size: .field))
+                    .disabled(fetching || draft.baseURL.isEmpty)
+                    .popover(isPresented: $showPicker, arrowEdge: .bottom) {
+                        ModelPickerView(models: remoteModels, role: draft.role, current: draft.model) { choose($0) }
                     }
                 }
-                .padding(Space.xl)
+                if let fetchError {
+                    Text(fetchError).font(.ui(TypeScale.caption)).foregroundStyle(Palette.danger)
+                }
+                Spacer(minLength: 0)
             }
+            .padding(Space.xl)
 
             RowDivider()
             HStack(spacing: Space.sm) {
-                Button { runTest() } label: {
-                    HStack(spacing: 7) {
-                        if testing { TokenSpinner() }
-                        Text("测试")
-                    }
+                if let saveError {
+                    Text(saveError).font(.ui(TypeScale.caption)).foregroundStyle(Palette.danger).lineLimit(2)
                 }
-                .buttonStyle(SecondaryButtonStyle())
-                .disabled(testing || apiKey.isEmpty || draft.model.isEmpty)
-                if let testResult { outcomeText(testResult) }
                 Spacer()
                 Button("取消", role: .cancel) { onClose() }.buttonStyle(SecondaryButtonStyle())
-                Button("保存") { save() }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(draft.name.isEmpty || draft.baseURL.isEmpty)
+                Button { save() } label: {
+                    HStack(spacing: 7) {
+                        if saving { TokenSpinner() }
+                        Text(saving ? "正在验证…" : "保存")
+                    }
+                }
+                .buttonStyle(PrimaryButtonStyle())
+                .keyboardShortcut(.defaultAction)
+                .disabled(saving || !canSave)
             }
             .padding(Space.lg)
         }
-        .frame(width: 540, height: 530)
+        .frame(width: 540, height: 400)
         .background(Palette.surface)
         .tokenRoot()
     }
 
-    private func outcomeText(_ outcome: Outcome) -> some View {
-        Group {
-            switch outcome {
-            case .success: Label("连接正常", systemImage: "checkmark").foregroundStyle(Palette.success)
-            case .failure(let message): Text(message).foregroundStyle(Palette.danger).lineLimit(2)
+    /// 保存前在后台验证一次：地址、Key、模型 ID 都可用才保存（接口格式、零数据保留在请求时自动处理）
+    private func save() {
+        draft.name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        draft.baseURL = draft.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        draft.model = draft.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        draft.format = draft.effectiveFormat
+        saving = true
+        saveError = nil
+        let profile = draft
+        let key = trimmedKey
+        Task {
+            let result = await ConnectionTester.test(profile, apiKey: key)
+            saving = false
+            switch result {
+            case .success:
+                let store = SettingsStore.shared
+                store.upsert(profile)
+                store.setAPIKey(key, for: profile)
+                onClose()
+            case .failure(let error):
+                saveError = "验证失败：\(error.localizedDescription)"
             }
         }
-        .font(.ui(TypeScale.caption))
-    }
-
-    private func save() {
-        let store = SettingsStore.shared
-        store.upsert(draft)
-        store.setAPIKey(apiKey, for: draft)
-        onClose()
     }
 
     private func fetchModels() {
@@ -230,7 +188,7 @@ struct ModelEditorView: View {
         fetchError = nil
         let base = draft.baseURL
         let role = draft.role
-        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = trimmedKey
         Task {
             do {
                 remoteModels = try await ModelCatalog.fetch(baseURL: base, apiKey: key, role: role)
@@ -244,32 +202,23 @@ struct ModelEditorView: View {
     }
 
     private func choose(_ model: RemoteModel) {
+        let previous = draft.model
         draft.model = model.id
-        // 名称还是模板默认值时，顺便改成所选模型的名字
+        // 名称还没填，或者还是上一个模型的默认名字时，顺便改成所选模型的名字
+        let previousName = remoteModels.first(where: { $0.id == previous })?.name
+        if draft.name.trimmingCharacters(in: .whitespaces).isEmpty || draft.name == previousName {
+            draft.name = model.name
+        }
         for prefix in ["OpenRouter · ", "OpenAI 兼容 · "] where draft.name.hasPrefix(prefix) {
             draft.name = prefix + model.name
         }
         showPicker = false
     }
-
-    private func runTest() {
-        testing = true
-        testResult = nil
-        let profile = draft
-        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        Task {
-            let result = await ConnectionTester.test(profile, apiKey: key)
-            testing = false
-            switch result {
-            case .success(let message): testResult = .success(message)
-            case .failure(let error): testResult = .failure(error.localizedDescription)
-            }
-        }
-    }
 }
 
 // MARK: - 模型选择弹窗
 
+/// 能识别出适合当前用途的模型时只列出这些（自动筛选），识别不出来时列出全部
 struct ModelPickerView: View {
     let models: [RemoteModel]
     let role: ModelRole
@@ -277,17 +226,15 @@ struct ModelPickerView: View {
     let onSelect: (RemoteModel) -> Void
 
     @State private var query = ""
-    @State private var onlyMatching = true
     @FocusState private var searchFocused: Bool
 
-    private var hasMatching: Bool { models.contains(where: \.matchesRole) }
-
     private var filtered: [RemoteModel] {
-        models.filter { model in
-            (!onlyMatching || !hasMatching || model.matchesRole)
-                && (query.isEmpty
-                    || model.id.localizedCaseInsensitiveContains(query)
-                    || model.name.localizedCaseInsensitiveContains(query))
+        let matching = models.filter(\.matchesRole)
+        let pool = matching.isEmpty ? models : matching
+        return pool.filter { model in
+            query.isEmpty
+                || model.id.localizedCaseInsensitiveContains(query)
+                || model.name.localizedCaseInsensitiveContains(query)
         }
     }
 
@@ -298,12 +245,6 @@ struct ModelPickerView: View {
                 TextField("搜索", text: $query).textFieldStyle(.plain).focused($searchFocused)
             }
             .modifier(InputChrome(focused: searchFocused, height: 36))
-            if hasMatching {
-                Toggle("只看\(role.displayName)模型", isOn: $onlyMatching)
-                    .toggleStyle(.checkbox)
-                    .font(.ui(TypeScale.meta, .regular))
-                    .foregroundStyle(Palette.textSecondary)
-            }
             ScrollView {
                 LazyVStack(spacing: 2) {
                     ForEach(filtered) { model in
@@ -330,48 +271,6 @@ struct ModelPickerView: View {
         .frame(width: 420, height: 440)
         .background(Palette.surface)
         .tokenRoot()
-    }
-}
-
-// MARK: - 输入
-
-struct InputSettingsView: View {
-    @ObservedObject private var store = SettingsStore.shared
-    @FocusState private var dictionaryFocused: Bool
-
-    var body: some View {
-        SettingsGroup(title: "快捷键") {
-            SettingsList {
-                SettingsRow(title: "按住说话") { KeyCaps(keys: ["Fn", "Control"]) }
-            }
-        }
-
-        SettingsGroup(title: "上屏") {
-            SettingsList {
-                SettingsRow(title: "方式") {
-                    Picker("方式", selection: $store.insertionMode) {
-                        ForEach(InsertionMode.allCases) { Text($0.displayName).tag($0) }
-                    }
-                    .pickerStyle(.menu).labelsHidden().fixedSize()
-                }
-                RowDivider()
-                SettingsRow(title: "繁体转简体") { inkSwitch("繁体转简体", isOn: $store.convertToSimplified) }
-                RowDivider()
-                SettingsRow(title: "提示音") { inkSwitch("提示音", isOn: $store.playSounds) }
-            }
-        }
-
-        SettingsGroup(title: "个人词典") {
-            TextEditor(text: Binding(
-                get: { store.dictionary.joined(separator: "\n") },
-                set: { store.dictionary = $0.split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
-            ))
-            .font(.mono(TypeScale.code))
-            .scrollContentBackground(.hidden)
-            .focused($dictionaryFocused)
-            .padding(.vertical, Space.sm)
-            .modifier(InputChrome(focused: dictionaryFocused, height: 120))
-        }
     }
 }
 

@@ -35,13 +35,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permissions.onAccessibilityGranted = { [weak self] in self?.startServices() }
         startServices()
 
-        // 首次使用：权限没给全或者没配 API Key，直接打开设置
+        // 权限没给全或者没配 API Key：先打开设置窗口（显示授权进度），再主动申请权限，
+        // 这样系统授权框和系统设置窗口会出现在设置窗口之上
         let store = SettingsStore.shared
         let missingKey = store.activeTranscription.map { store.apiKey(for: $0).isEmpty } ?? true
         if !permissions.allGranted || missingKey {
             settingsWindow.show()
-            permissions.startPolling()
         }
+        // 一启动就主动申请麦克风和辅助功能权限，不等用户操作
+        permissions.requestOnLaunch()
+        if !permissions.allGranted { permissions.startPolling() }
     }
 
     /// 快捷键监听需要辅助功能权限；授权后再调用一次即可生效，不需要重启

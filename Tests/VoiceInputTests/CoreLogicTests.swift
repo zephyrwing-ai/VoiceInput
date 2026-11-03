@@ -157,3 +157,37 @@ final class ModelCatalogTests: XCTestCase {
         XCTAssertThrowsError(try ModelCatalog.parse(["error": ["message": "bad"]], role: .polish))
     }
 }
+
+final class AutoConfigTests: XCTestCase {
+    func testFormatInferredFromBaseURL() {
+        XCTAssertEqual(APIFormat.transcriptionFormat(for: "https://openrouter.ai/api/v1"), .openRouterTranscription)
+        XCTAssertEqual(APIFormat.transcriptionFormat(for: "https://api.groq.com/openai/v1"), .openAIMultipartTranscription)
+        let profile = ModelProfile(name: "x", format: .openAIMultipartTranscription,
+                                   baseURL: "https://OpenRouter.ai/api/v1", model: "m")
+        XCTAssertEqual(profile.effectiveFormat, .openRouterTranscription)
+    }
+
+    func testTimeoutScalesWithAudioLength() {
+        XCTAssertEqual(TranscriptionService.timeout(forWAVBytes: 44 + 32_000), 15)          // 1 秒
+        XCTAssertEqual(TranscriptionService.timeout(forWAVBytes: 44 + 32_000 * 30), 40)     // 30 秒
+        XCTAssertEqual(TranscriptionService.timeout(forWAVBytes: 44 + 32_000 * 600), 120)   // 上限
+    }
+
+    func testDetectsNoZDREndpointError() {
+        let error = ServiceError.http(404, "No endpoints found matching your data policy (Zero data retention).")
+        XCTAssertTrue(TranscriptionService.isNoZDREndpointError(error))
+        XCTAssertFalse(TranscriptionService.isNoZDREndpointError(ServiceError.http(404, "Model not found")))
+        XCTAssertFalse(TranscriptionService.isNoZDREndpointError(ServiceError.http(401, "data policy")))
+    }
+
+    func testOldSettingsWithRemovedFieldsStillDecode() throws {
+        let json = """
+        {"id":"\(UUID().uuidString)","name":"旧配置","format":"openRouterTranscription",
+         "baseURL":"https://openrouter.ai/api/v1","model":"openai/whisper-large-v3-turbo",
+         "language":"zh","temperature":0.3,"zeroDataRetention":false,"timeout":30}
+        """
+        let profile = try JSONDecoder().decode(ModelProfile.self, from: Data(json.utf8))
+        XCTAssertEqual(profile.model, "openai/whisper-large-v3-turbo")
+        XCTAssertEqual(profile.role, .transcription)
+    }
+}

@@ -42,8 +42,8 @@ final class SettingsStore: ObservableObject {
     }
 
     var activePolish: ModelProfile? {
-        guard polishEnabled else { return nil }
-        return profiles.first { $0.id == activePolishID && $0.role == .polish }
+        // 润色入口已经移除，不再在后台调用隐藏的模型；旧配置与 API Key 保留。
+        nil
     }
 
     func profiles(for role: ModelRole) -> [ModelProfile] {

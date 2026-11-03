@@ -63,7 +63,7 @@ enum TextPolisher {
         guard let profile, PolishDecider.needsModel(cleaned, context) else { return cleaned }
         do {
             let service = try PolishService(profile: profile, apiKey: apiKey)
-            let output = try await withTimeout(seconds: profile.timeout) {
+            let output = try await withTimeout(seconds: PolishService.timeout) {
                 try await service.complete(system: PolishPrompt.system(for: context),
                                            user: PolishPrompt.user(cleaned))
             }

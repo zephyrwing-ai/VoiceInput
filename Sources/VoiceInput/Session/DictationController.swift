@@ -120,7 +120,7 @@ final class DictationController: HotkeyMonitorDelegate {
         discard(session)
     }
 
-    // MARK: - 麦克风权限：第一次按下快捷键时就地申请
+    // MARK: - 麦克风权限：启动时已主动申请，这里兜底（用户关掉了弹框或之后在系统设置里关闭）
 
     /// 已授权返回 true。否则就地处理，返回 false，本次按键不录音。
     private func ensureMicrophone() -> Bool {

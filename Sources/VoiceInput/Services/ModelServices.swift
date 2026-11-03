@@ -62,28 +62,60 @@ struct TranscriptionService {
     let profile: ModelProfile
     let apiKey: String
 
+    /// 选中的模型在 OpenRouter 上没有零数据保留端点时记下来，之后直接走普通路由，不再多发一次请求
+    @MainActor private static var noZDRModels = Set<String>()
+
     init(profile: ModelProfile, apiKey: String) throws {
         guard !apiKey.isEmpty else { throw ServiceError.missingAPIKey(profile.name) }
         self.profile = profile
         self.apiKey = apiKey
     }
 
+    /// 超时按音频长度自动计算：16kHz 单声道 16 位 = 32000 字节/秒，基础 15 秒，长录音按时长加，最多 120 秒
+    static func timeout(forWAVBytes bytes: Int) -> Double {
+        let seconds = Double(max(bytes - 44, 0)) / 32_000
+        return min(120, max(15, 10 + seconds))
+    }
+
+    /// OpenRouter 返回"没有符合数据策略的端点"
+    static func isNoZDREndpointError(_ error: Error) -> Bool {
+        guard case ServiceError.http(let code, let message) = error, code == 404 else { return false }
+        let lower = message.lowercased()
+        return lower.contains("data policy") || lower.contains("zero data retention")
+    }
+
     /// - Parameters:
     ///   - wav: 16kHz 单声道 WAV
     ///   - prompt: 上文或词典提示（OpenRouter 的 JSON 接口会忽略）
     func transcribe(wav: Data, prompt: String? = nil) async throws -> String {
-        let url = try HTTP.endpoint(profile.baseURL, "/audio/transcriptions")
-        var request = HTTP.request(url, apiKey: apiKey, timeout: profile.timeout)
+        guard profile.effectiveFormat == .openRouterTranscription else {
+            return try await send(wav: wav, prompt: prompt, zdr: false)
+        }
+        // OpenRouter：优先只走零数据保留的端点；这个模型没有此类端点时，自动改用普通路由
+        let key = profile.baseURL + "|" + profile.model
+        if await Self.noZDRModels.contains(key) {
+            return try await send(wav: wav, prompt: prompt, zdr: false)
+        }
+        do {
+            return try await send(wav: wav, prompt: prompt, zdr: true)
+        } catch let error where Self.isNoZDREndpointError(error) {
+            NSLog("[VoiceInput] \(profile.model) 没有零数据保留端点，改用普通路由")
+            await MainActor.run { _ = Self.noZDRModels.insert(key) }
+            return try await send(wav: wav, prompt: prompt, zdr: false)
+        }
+    }
 
-        switch profile.format {
+    private func send(wav: Data, prompt: String?, zdr: Bool) async throws -> String {
+        let url = try HTTP.endpoint(profile.baseURL, "/audio/transcriptions")
+        var request = HTTP.request(url, apiKey: apiKey, timeout: Self.timeout(forWAVBytes: wav.count))
+
+        switch profile.effectiveFormat {
         case .openRouterTranscription:
             var body: [String: Any] = [
                 "model": profile.model,
                 "input_audio": ["data": wav.base64EncodedString(), "format": "wav"],
             ]
-            if profile.temperature > 0 { body["temperature"] = profile.temperature }
-            if !profile.language.isEmpty { body["language"] = profile.language }
-            if profile.zeroDataRetention { body["provider"] = ["zdr": true] }
+            if zdr { body["provider"] = ["zdr": true] }
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -92,8 +124,6 @@ struct TranscriptionService {
             form.addFile(name: "file", filename: "audio.wav", mimeType: "audio/wav", data: wav)
             form.addField(name: "model", value: profile.model)
             form.addField(name: "response_format", value: "json")
-            if profile.temperature > 0 { form.addField(name: "temperature", value: String(profile.temperature)) }
-            if !profile.language.isEmpty { form.addField(name: "language", value: profile.language) }
             if let prompt, !prompt.isEmpty { form.addField(name: "prompt", value: prompt) }
             request.setValue(form.contentType, forHTTPHeaderField: "Content-Type")
             request.httpBody = form.finalize()
@@ -113,6 +143,8 @@ struct TranscriptionService {
 struct PolishService {
     let profile: ModelProfile
     let apiKey: String
+    /// 润色要快，超时就退回规则清理结果
+    static let timeout: Double = 3
 
     init(profile: ModelProfile, apiKey: String) throws {
         guard !apiKey.isEmpty else { throw ServiceError.missingAPIKey(profile.name) }
@@ -123,10 +155,10 @@ struct PolishService {
 
     func complete(system: String, user: String) async throws -> String {
         let url = try HTTP.endpoint(profile.baseURL, "/chat/completions")
-        var request = HTTP.request(url, apiKey: apiKey, timeout: profile.timeout)
+        var request = HTTP.request(url, apiKey: apiKey, timeout: Self.timeout)
         let body: [String: Any] = [
             "model": profile.model,
-            "temperature": profile.temperature,
+            "temperature": 0,
             "max_tokens": max(64, user.count * 2),
             "messages": [
                 ["role": "system", "content": system],
