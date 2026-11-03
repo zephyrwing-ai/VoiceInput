@@ -1,0 +1,147 @@
+import AppKit
+import ApplicationServices
+
+/// 把文字写进目标输入框。一次录音对应一个 session：
+/// 剪贴板只在第一次粘贴前备份、录音结束后恢复一次。
+@MainActor
+final class TextInserter {
+    enum Method { case accessibility, paste }
+
+    private var clipboardBackup: [NSPasteboardItem]?
+    private var ourChangeCount: Int?
+    /// 本次录音第一段文字写入前的光标位置（UTF-16），用于松手后整段替换
+    private var startLocation: Int?
+    /// 本次录音已经写进去的全部文字
+    private(set) var insertedText = ""
+
+    func beginSession() {
+        clipboardBackup = nil
+        ourChangeCount = nil
+        startLocation = nil
+        insertedText = ""
+    }
+
+    /// 写入一段文字。返回 nil 表示写入失败。
+    func insert(_ text: String, into target: FocusTarget) -> Method? {
+        guard !text.isEmpty, let element = target.element, !target.isSecure else { return nil }
+        if startLocation == nil, let range = AX.range(element) { startLocation = range.location }
+
+        let method: Method
+        if insertViaAccessibility(text, element: element) {
+            method = .accessibility
+        } else {
+            paste(text)
+            method = .paste
+        }
+        insertedText += text
+        return method
+    }
+
+    /// 写入之前检查：焦点还在原来的输入框上
+    func isStillFocused(_ target: FocusTarget) -> Bool {
+        guard let element = target.element else { return false }
+        let systemWide = AXUIElementCreateSystemWide()
+        guard let current = AX.element(systemWide, kAXFocusedUIElementAttribute) else {
+            return true   // 读不到就不阻止（部分应用不支持系统级查询）
+        }
+        return CFEqual(current, element)
+    }
+
+    /// 能否把本次写入的文字整段替换成润色结果（设计文档 §13.5 的"终稿替换"校验）
+    func canReplaceInsertedText(in target: FocusTarget) -> Bool {
+        guard let element = target.element, let start = startLocation, !insertedText.isEmpty else { return false }
+        let length = insertedText.utf16.count
+        guard let current = AX.range(element), current.location == start + length, current.length == 0 else { return false }
+        return AX.string(element, in: CFRange(location: start, length: length)) == insertedText
+    }
+
+    /// 整段替换。任何一步失败都不改动用户的文字。
+    func replaceInsertedText(with newText: String, in target: FocusTarget) -> Bool {
+        guard newText != insertedText, canReplaceInsertedText(in: target),
+              let element = target.element, let start = startLocation else { return false }
+        let length = insertedText.utf16.count
+        guard AX.setRange(element, CFRange(location: start, length: length)) else { return false }
+        let ok = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, newText as CFString) == .success
+        let verified = ok && AX.string(element, in: CFRange(location: start, length: newText.utf16.count)) == newText
+        if !verified {
+            // 恢复光标到原来的位置
+            AX.setRange(element, CFRange(location: start + length, length: 0))
+            return false
+        }
+        insertedText = newText
+        return true
+    }
+
+    /// 录音结束：稍等目标应用读取完剪贴板，再恢复用户原来的剪贴板内容
+    func endSession() {
+        guard let backup = clipboardBackup, let ourChangeCount else { return }
+        clipboardBackup = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            let pasteboard = NSPasteboard.general
+            guard pasteboard.changeCount == ourChangeCount else { return }  // 用户期间又复制了别的，就不覆盖
+            pasteboard.clearContents()
+            if !backup.isEmpty { pasteboard.writeObjects(backup) }
+        }
+    }
+
+    /// 无法插入时：把文字留在剪贴板里（不恢复），配合卡片提示用户手动粘贴
+    func copyForManualPaste(_ text: String) {
+        clipboardBackup = nil
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    // MARK: - 写入方式
+
+    /// 原生控件优先：直接设置选中文本，不碰剪贴板。只在能读回校验时使用，避免重复写入。
+    private func insertViaAccessibility(_ text: String, element: AXUIElement) -> Bool {
+        guard AX.isSettable(element, kAXSelectedTextAttribute) else { return false }
+        let before = AX.string(element, kAXValueAttribute)
+        let rangeBefore = AX.range(element)
+        guard before != nil || rangeBefore != nil else { return false }
+
+        guard AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success else {
+            return false
+        }
+        if let before, let after = AX.string(element, kAXValueAttribute) {
+            return after != before && after.contains(text)
+        }
+        if let rangeBefore, let rangeAfter = AX.range(element) {
+            return rangeAfter.location == rangeBefore.location + text.utf16.count
+        }
+        return false
+    }
+
+    private func paste(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        if clipboardBackup == nil {
+            clipboardBackup = pasteboard.pasteboardItems?.map { item in
+                let copy = NSPasteboardItem()
+                for type in item.types {
+                    if let data = item.data(forType: type) { copy.setData(data, forType: type) }
+                }
+                return copy
+            } ?? []
+        }
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        // 告诉剪贴板管理工具：这是临时内容，不要记录
+        pasteboard.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
+        pasteboard.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType"))
+        ourChangeCount = pasteboard.changeCount
+
+        postCommandV()
+    }
+
+    private func postCommandV() {
+        let source = CGEventSource(stateID: .privateState)
+        let keyV: CGKeyCode = 0x09
+        for isDown in [true, false] {
+            guard let event = CGEvent(keyboardEventSource: source, virtualKey: keyV, keyDown: isDown) else { continue }
+            event.flags = .maskCommand   // 只带 ⌘，不带用户正按着的 Fn / Control
+            event.setIntegerValueField(.eventSourceUserData, value: SyntheticEvent.marker)
+            event.post(tap: .cghidEventTap)
+        }
+    }
+}
