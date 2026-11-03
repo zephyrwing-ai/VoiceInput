@@ -56,3 +56,25 @@ enum ModelCatalog {
         }
     }
 }
+
+enum CloudModelCatalogError: LocalizedError {
+    case noTranscriptionModels
+
+    var errorDescription: String? {
+        switch self {
+        case .noTranscriptionModels:
+            return "没有找到可用的语音识别模型"
+        }
+    }
+}
+
+/// Resolve a cloud provider catalog into the model entries persisted with that provider.
+enum CloudModelCatalog {
+    static func fetch(baseURL: String, apiKey: String) async throws -> [CloudModel] {
+        let remote = try await ModelCatalog.fetch(baseURL: baseURL, apiKey: apiKey, role: .transcription)
+        let preferred = remote.filter(\.matchesRole)
+        let models = preferred.isEmpty ? remote : preferred
+        guard !models.isEmpty else { throw CloudModelCatalogError.noTranscriptionModels }
+        return models.map { CloudModel(modelID: $0.id, name: $0.name) }
+    }
+}

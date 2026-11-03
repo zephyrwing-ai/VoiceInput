@@ -1,6 +1,6 @@
 import Foundation
 
-/// 当前输入的 App 属于哪一类，决定润色风格（见设计文档 §13.6）
+/// 当前输入的 App 属于哪一类。目前只用于日志排查，不会影响写入的文字。
 enum AppCategory: String, Codable, CaseIterable {
     case chat, email, document, aiChat, code, general
 
@@ -12,19 +12,6 @@ enum AppCategory: String, Codable, CaseIterable {
         case .aiChat: return "AI 对话"
         case .code: return "代码 / 终端"
         case .general: return "通用"
-        }
-    }
-
-    /// 只做规则清理，不调用润色模型
-    var rulesOnly: Bool { self == .aiChat || self == .code }
-
-    /// 写进提示词的风格说明
-    var styleInstruction: String {
-        switch self {
-        case .chat: return "聊天消息。保持用户的口吻，简洁自然，句末可以不加句号，不要写成书面公文。"
-        case .email: return "邮件正文。语气礼貌、书面，句子完整，可以分段。"
-        case .document: return "文档。结构清晰；口述的列表整理成编号列表。"
-        case .aiChat, .code, .general: return "自然通顺的书面表达。"
         }
     }
 

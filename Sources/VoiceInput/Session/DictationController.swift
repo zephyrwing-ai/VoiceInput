@@ -2,7 +2,10 @@ import AppKit
 
 /// 一次"按住说"的完整流程：
 /// 按下 → 记录焦点 → 录音（实时模式按停顿切段，逐段识别、逐段上屏）
-/// 松手 → 识别最后一段 → 润色 → 能整段替换就替换 → 恢复剪贴板
+/// 松手 → 识别最后一段 → 恢复剪贴板
+///
+/// 识别模型返回什么就写入什么：不删语气词、不去重、不补标点、不调用润色模型，
+/// 也不给识别模型附加上文或词典提示。唯一的处理是按系统首选语言统一简繁字形（见 ChineseScript）。
 @MainActor
 final class DictationController: HotkeyMonitorDelegate {
     private let settings = SettingsStore.shared
@@ -19,14 +22,20 @@ final class DictationController: HotkeyMonitorDelegate {
     private final class Session {
         let target: FocusTarget
         let mode: InsertionMode
+        /// 按下时从系统首选语言读出的中文书写形式；nil 表示系统语言里没有中文，不转换
+        let script: ChineseScript?
         let startedAt = Date()
         var receivedAudio = false
         var pipeline: Task<Void, Never>?
-        var allText = ""          // 本次识别出的全部文字（已清理、已拼接）
+        var allText = ""          // 本次识别出的全部文字（模型原文，按段拼接）
         var pendingText = ""      // 没能写进输入框的部分
         var liveStopped = false   // 焦点变了或写入失败：停止实时上屏
         var lastError: Error?
-        init(target: FocusTarget, mode: InsertionMode) { self.target = target; self.mode = mode }
+        init(target: FocusTarget, mode: InsertionMode, script: ChineseScript?) {
+            self.target = target
+            self.mode = mode
+            self.script = script
+        }
     }
 
     private enum State { case idle, recording(Session), finishing }
@@ -53,8 +62,9 @@ final class DictationController: HotkeyMonitorDelegate {
         guard case .idle = state else { return }   // 上一次还在收尾，忽略
         permissions.refresh()
         guard ensureMicrophone() else { return }
-        guard let profile = settings.activeTranscription, !settings.apiKey(for: profile).isEmpty else {
-            return showSetupError("还没有配置语音识别模型或 API Key，请在设置中添加")
+        guard let profile = settings.activeTranscription,
+              profile.isReady(apiKey: settings.apiKey(for: profile)) else {
+            return showSetupError("还没有配置语音识别模型，请在设置中添加")
         }
 
         let target = FocusInspector.capture()
@@ -67,7 +77,9 @@ final class DictationController: HotkeyMonitorDelegate {
         let canLive = target.element != nil && target.isEditable && !target.isSearchField
         let mode: InsertionMode = canLive ? settings.insertionMode : .oneShot
 
-        let session = Session(target: target, mode: mode)
+        let script = ChineseScript.preferred()
+        NSLog("[VoiceInput] 系统语言：\(Locale.preferredLanguages.joined(separator: ", "))，中文输出：\(script?.displayName ?? "保持原样")")
+        let session = Session(target: target, mode: mode, script: script)
         inserter.beginSession()
         do {
             try recorder.start(segmenting: mode == .live)
@@ -162,11 +174,9 @@ final class DictationController: HotkeyMonitorDelegate {
     }
 
     private func processLiveSegment(_ wav: Data, session: Session) async {
-        guard let text = await transcribe(wav, session: session) else { return }
-        let cleaned = RuleCleaner.clean(text, options: .init(convertToSimplified: settings.convertToSimplified))
-        guard !cleaned.isEmpty else { return }
+        guard let text = await transcribe(wav, session: session), !text.isEmpty else { return }
 
-        let piece = RuleCleaner.separator(between: session.allText, and: cleaned) + cleaned
+        let piece = TranscriptJoiner.separator(between: session.allText, and: text) + text
         session.allText += piece
 
         if !session.liveStopped, inserter.isStillFocused(session.target),
@@ -179,7 +189,6 @@ final class DictationController: HotkeyMonitorDelegate {
 
     private func finishLive(_ session: Session) async {
         guard !session.allText.isEmpty else { return showFailure(session) }
-        let category = session.target.category
 
         if session.liveStopped {
             inserter.endSession()
@@ -187,19 +196,7 @@ final class DictationController: HotkeyMonitorDelegate {
             return showCard(session.pendingText, note: "输入框已切换，后面的内容没有写入，已复制到剪贴板")
         }
 
-        // 松手后整段润色：只有能可靠地整段替换时才调用模型
-        let canReplace = inserter.canReplaceInsertedText(in: session.target)
-        let context = PolishContext(category: category, dictionary: settings.dictionary, canReplaceInsertedText: canReplace)
-        let polished = await polish(session.allText, context: context)
-        let finalText = RuleCleaner.finalizeEnding(polished, category: category)
-
-        if finalText != inserter.insertedText {
-            if canReplace, inserter.replaceInsertedText(with: finalText, in: session.target) {
-                // 已替换成润色后的版本
-            } else if finalText.hasPrefix(inserter.insertedText) {
-                _ = inserter.insert(String(finalText.dropFirst(inserter.insertedText.count)), into: session.target)  // 补句末标点
-            }
-        }
+        // 每一段在识别完成时已经原样写入，松手后不再改动输入框里的文字
         lastResult = inserter.insertedText
         inserter.endSession()
         hud.hide()
@@ -208,47 +205,37 @@ final class DictationController: HotkeyMonitorDelegate {
     // MARK: - 一次性模式
 
     private func finishOneShot(_ session: Session, samples: [Float]) async {
-        guard let text = await transcribe(WAVEncoder.encode(samples: samples), session: session) else {
+        guard let text = await transcribe(WAVEncoder.encode(samples: samples), session: session), !text.isEmpty else {
             return showFailure(session)
         }
-        let cleaned = RuleCleaner.clean(text, options: .init(convertToSimplified: settings.convertToSimplified))
-        guard !cleaned.isEmpty else { return showFailure(session) }
-
-        let category = session.target.category
-        let context = PolishContext(category: category, dictionary: settings.dictionary, canReplaceInsertedText: true)
-        let finalText = RuleCleaner.finalizeEnding(await polish(cleaned, context: context), category: category)
-        lastResult = finalText
+        lastResult = text
 
         let target = session.target
         if target.element != nil, target.isEditable, inserter.isStillFocused(target),
-           inserter.insert(finalText, into: target) != nil {
+           inserter.insert(text, into: target) != nil {
             inserter.endSession()
             hud.hide()
         } else {
-            showCard(finalText, note: "没有找到可以输入的位置，已复制到剪贴板，按 ⌘V 粘贴")
+            showCard(text, note: "没有找到可以输入的位置，已复制到剪贴板，按 ⌘V 粘贴")
         }
     }
 
     // MARK: - 模型调用
 
+    /// 只把录音发给识别模型，返回模型的识别结果（只按系统语言统一简繁字形）
     private func transcribe(_ wav: Data, session: Session) async -> String? {
         guard let profile = settings.activeTranscription else { return nil }
         do {
-            let service = try TranscriptionService(profile: profile, apiKey: settings.apiKey(for: profile))
-            // 上文 + 词典作为提示（只有 OpenAI 兼容的 multipart 接口会使用）
-            let context = String(session.allText.suffix(120))
-            let prompt = ([context] + settings.dictionary).filter { !$0.isEmpty }.joined(separator: " ")
-            return try await service.transcribe(wav: wav, prompt: prompt)
+            let resolved = try await LocalModelRuntimeManager.shared.prepare(profile)
+            let service = try TranscriptionService(profile: resolved, apiKey: settings.apiKey(for: profile))
+            let raw = try await service.transcribe(wav: wav)
+            LocalModelRuntimeManager.shared.markUsed()
+            return session.script?.convert(raw) ?? raw
         } catch {
             NSLog("[VoiceInput] 识别失败：\(error.localizedDescription)")
             session.lastError = error
             return nil
         }
-    }
-
-    private func polish(_ text: String, context: PolishContext) async -> String {
-        guard let profile = settings.activePolish else { return text }
-        return await TextPolisher.polish(text, context: context, profile: profile, apiKey: settings.apiKey(for: profile))
     }
 
     // MARK: - 收尾

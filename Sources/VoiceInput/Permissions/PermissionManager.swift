@@ -1,6 +1,8 @@
 import AppKit
 import AVFoundation
 import ApplicationServices
+import CoreGraphics
+import Darwin
 
 @MainActor
 final class PermissionManager: ObservableObject {
@@ -14,6 +16,8 @@ final class PermissionManager: ObservableObject {
     private var pollTimer: Timer?
     /// 启动引导进行中：辅助功能授权后，如果麦克风之前被拒绝，接着打开麦克风设置页
     private var launchFlowActive = false
+    /// 本次运行是否由 VoiceInput 触发过系统的 Accessibility Access 提示。
+    private var requestedAccessibilityPrompt = false
 
     var allGranted: Bool { microphone == .authorized && accessibility }
 
@@ -27,6 +31,7 @@ final class PermissionManager: ObservableObject {
         if trusted != accessibility { accessibility = trusted }
         if trusted && !wasGranted {
             onAccessibilityGranted?()
+            dismissAccessibilityPromptIfNeeded()
             if launchFlowActive {
                 launchFlowActive = false
                 if microphone == .denied || microphone == .restricted { openMicrophoneSettings() }
@@ -94,10 +99,37 @@ final class PermissionManager: ObservableObject {
 
     /// 弹出系统提示（会把本 App 加入"辅助功能"列表），打开设置页，并开始轮询授权状态
     func requestAccessibility() {
+        requestedAccessibilityPrompt = true
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
         _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
         open("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
         startPolling()
+    }
+
+    /// The Accessibility prompt is owned by the system process
+    /// `universalAccessAuthWarn`, not by VoiceInput. It does not close itself when
+    /// the user flips the switch in System Settings, so after TCC reports trust we
+    /// terminate only that prompt process. `tccd` and System Settings stay alive.
+    private func dismissAccessibilityPromptIfNeeded() {
+        guard requestedAccessibilityPrompt else { return }
+        requestedAccessibilityPrompt = false
+        guard let windows = CGWindowListCopyWindowInfo(
+            [.optionAll, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return }
+
+        var pids = Set<pid_t>()
+        for window in windows {
+            guard let owner = window[kCGWindowOwnerName as String] as? String,
+                  owner == "universalAccessAuthWarn",
+                  let pid = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value else {
+                continue
+            }
+            pids.insert(pid)
+        }
+        for pid in pids {
+            _ = kill(pid, SIGTERM)
+        }
     }
 
     func startPolling() {

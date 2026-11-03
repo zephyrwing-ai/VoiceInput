@@ -2,9 +2,10 @@ import SwiftUI
 import AppKit
 
 /// 首次引导（设计文档 §13.3）：
-/// ① 辅助功能：先说明用途，再打开系统设置，轮询到授权后自动回到这里
-/// ② 配置语音识别模型
-/// ③ 试一试：第一次按下 Fn + Control 时，系统会弹出麦克风授权框（就地申请）
+/// ① 麦克风：首次启动时请求系统授权
+/// ② 辅助功能：先说明用途，再打开系统设置，轮询到授权后自动回到这里
+/// ③ 配置语音识别模型
+/// ④ 试一试
 struct OnboardingView: View {
     @ObservedObject private var permissions = PermissionManager.shared
     @ObservedObject private var store = SettingsStore.shared
@@ -14,10 +15,12 @@ struct OnboardingView: View {
 
     private var modelReady: Bool {
         guard let profile = store.activeTranscription else { return false }
-        return !store.apiKey(for: profile).isEmpty && !profile.model.isEmpty
+        return profile.isReady(apiKey: store.apiKey(for: profile))
     }
 
-    private var allReady: Bool { permissions.accessibility && modelReady }
+    private var allReady: Bool {
+        permissions.microphone == .authorized && permissions.accessibility && modelReady
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -30,7 +33,15 @@ struct OnboardingView: View {
             .padding(.bottom, Space.xl)
 
             VStack(spacing: Space.sm) {
-                step(number: 1, title: "允许\"辅助功能\"", done: permissions.accessibility) {
+                step(number: 1, title: "允许使用麦克风", done: permissions.microphone == .authorized) {
+                    if permissions.microphone == .denied || permissions.microphone == .restricted {
+                        Text("麦克风权限已关闭，可以在系统设置中重新打开。")
+                    }
+                } action: {
+                    Button("去授权") { permissions.requestMicrophone() }
+                }
+
+                step(number: 2, title: "允许\"辅助功能\"", done: permissions.accessibility) {
                     if waitingForAccessibility && !permissions.accessibility {
                         HStack(alignment: .firstTextBaseline, spacing: Space.sm) {
                             TokenSpinner()
@@ -48,7 +59,7 @@ struct OnboardingView: View {
                     }
                 }
 
-                step(number: 2, title: "配置语音识别模型", done: modelReady) {
+                step(number: 3, title: "配置语音识别模型", done: modelReady) {
                     if let profile = store.activeTranscription, modelReady {
                         Text("当前使用：\(profile.name)")
                     }
@@ -56,7 +67,7 @@ struct OnboardingView: View {
                     Button("去配置", action: openSettings)
                 }
 
-                step(number: 3, title: "试一试", done: false, enabled: allReady) {
+                step(number: 4, title: "试一试", done: false, enabled: allReady) {
                     Text("在任意输入框按住 Fn + Control 说一句话")
                 } action: {
                     Button("打开备忘录") { openNotes() }
@@ -76,7 +87,7 @@ struct OnboardingView: View {
         .padding(.horizontal, 5 * Space.frameGap)
         .padding(.top, 6 * Space.frameGap)
         .padding(.bottom, Space.xl)
-        .frame(width: 600, height: 560)
+        .frame(width: 600, height: 620)
         .background(Palette.surface)
         .ignoresSafeArea()
         .tokenRoot()

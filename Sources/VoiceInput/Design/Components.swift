@@ -135,6 +135,7 @@ struct Field<Content: View>: View {
 struct InputChrome: ViewModifier {
     let focused: Bool
     var height: CGFloat? = Metrics.fieldHeight
+    var showsFocusHalo: Bool = true
     func body(content: Content) -> some View {
         content
             .font(.ui(TypeScale.code, .regular))
@@ -143,9 +144,11 @@ struct InputChrome: ViewModifier {
             .frame(height: height)
             .background(RoundedRectangle(cornerRadius: Radius.control).fill(focused ? Palette.surface : Palette.input))
             .overlay(RoundedRectangle(cornerRadius: Radius.control)
-                .strokeBorder(focused ? Palette.accent : Palette.border, lineWidth: Metrics.borderWidth))
+                .strokeBorder(focused && showsFocusHalo ? Palette.accent : Palette.border,
+                              lineWidth: Metrics.borderWidth))
             .overlay(RoundedRectangle(cornerRadius: Radius.control + 2)
-                .strokeBorder(focused ? Palette.focusRing : .clear, lineWidth: 2).padding(-2))
+                .strokeBorder(focused && showsFocusHalo ? Palette.focusRing : .clear, lineWidth: 2)
+                .padding(-2))
     }
 }
 
@@ -154,6 +157,7 @@ struct TokenTextField: View {
     @Binding var text: String
     var prompt: String = ""
     var secure = false
+    var showsFocusHalo = true
     @FocusState private var focused: Bool
     @State private var revealed = false
 
@@ -179,7 +183,7 @@ struct TokenTextField: View {
                     .help(revealed ? "隐藏 API Key" : "显示 API Key")
                 }
             }
-            .modifier(InputChrome(focused: focused))
+            .modifier(InputChrome(focused: focused, showsFocusHalo: showsFocusHalo))
             .tokenAnimation(Motion.fast, value: focused)
         }
     }

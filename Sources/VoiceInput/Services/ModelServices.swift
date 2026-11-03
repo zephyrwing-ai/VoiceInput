@@ -66,7 +66,9 @@ struct TranscriptionService {
     @MainActor private static var noZDRModels = Set<String>()
 
     init(profile: ModelProfile, apiKey: String) throws {
-        guard !apiKey.isEmpty else { throw ServiceError.missingAPIKey(profile.name) }
+        if profile.requiresAPIKey, apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw ServiceError.missingAPIKey(profile.name)
+        }
         self.profile = profile
         self.apiKey = apiKey
     }
@@ -84,28 +86,26 @@ struct TranscriptionService {
         return lower.contains("data policy") || lower.contains("zero data retention")
     }
 
-    /// - Parameters:
-    ///   - wav: 16kHz 单声道 WAV
-    ///   - prompt: 上文或词典提示（OpenRouter 的 JSON 接口会忽略）
-    func transcribe(wav: Data, prompt: String? = nil) async throws -> String {
+    /// 只发送录音本身（16kHz 单声道 WAV），不附加任何提示词，返回模型的原始识别文字
+    func transcribe(wav: Data) async throws -> String {
         guard profile.effectiveFormat == .openRouterTranscription else {
-            return try await send(wav: wav, prompt: prompt, zdr: false)
+            return try await send(wav: wav, zdr: false)
         }
         // OpenRouter：优先只走零数据保留的端点；这个模型没有此类端点时，自动改用普通路由
         let key = profile.baseURL + "|" + profile.model
         if await Self.noZDRModels.contains(key) {
-            return try await send(wav: wav, prompt: prompt, zdr: false)
+            return try await send(wav: wav, zdr: false)
         }
         do {
-            return try await send(wav: wav, prompt: prompt, zdr: true)
+            return try await send(wav: wav, zdr: true)
         } catch let error where Self.isNoZDREndpointError(error) {
             NSLog("[VoiceInput] \(profile.model) 没有零数据保留端点，改用普通路由")
             await MainActor.run { _ = Self.noZDRModels.insert(key) }
-            return try await send(wav: wav, prompt: prompt, zdr: false)
+            return try await send(wav: wav, zdr: false)
         }
     }
 
-    private func send(wav: Data, prompt: String?, zdr: Bool) async throws -> String {
+    private func send(wav: Data, zdr: Bool) async throws -> String {
         let url = try HTTP.endpoint(profile.baseURL, "/audio/transcriptions")
         var request = HTTP.request(url, apiKey: apiKey, timeout: Self.timeout(forWAVBytes: wav.count))
 
@@ -124,7 +124,6 @@ struct TranscriptionService {
             form.addFile(name: "file", filename: "audio.wav", mimeType: "audio/wav", data: wav)
             form.addField(name: "model", value: profile.model)
             form.addField(name: "response_format", value: "json")
-            if let prompt, !prompt.isEmpty { form.addField(name: "prompt", value: prompt) }
             request.setValue(form.contentType, forHTTPHeaderField: "Content-Type")
             request.httpBody = form.finalize()
 
@@ -134,46 +133,8 @@ struct TranscriptionService {
 
         let json = try await HTTP.send(request)
         guard let text = json["text"] as? String else { throw ServiceError.emptyResponse }
+        // 只去掉首尾空白（Whisper 常在开头带一个空格），正文保持原样
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-}
-
-// MARK: - 文字润色
-
-struct PolishService {
-    let profile: ModelProfile
-    let apiKey: String
-    /// 润色要快，超时就退回规则清理结果
-    static let timeout: Double = 3
-
-    init(profile: ModelProfile, apiKey: String) throws {
-        guard !apiKey.isEmpty else { throw ServiceError.missingAPIKey(profile.name) }
-        guard !profile.model.isEmpty else { throw ServiceError.notConfigured("润色") }
-        self.profile = profile
-        self.apiKey = apiKey
-    }
-
-    func complete(system: String, user: String) async throws -> String {
-        let url = try HTTP.endpoint(profile.baseURL, "/chat/completions")
-        var request = HTTP.request(url, apiKey: apiKey, timeout: Self.timeout)
-        let body: [String: Any] = [
-            "model": profile.model,
-            "temperature": 0,
-            "max_tokens": max(64, user.count * 2),
-            "messages": [
-                ["role": "system", "content": system],
-                ["role": "user", "content": user],
-            ],
-        ]
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let json = try await HTTP.send(request)
-        guard let choices = json["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
-              let content = message["content"] as? String,
-              !content.isEmpty else { throw ServiceError.emptyResponse }
-        return content.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -181,19 +142,15 @@ struct PolishService {
 
 enum ConnectionTester {
     static func test(_ profile: ModelProfile, apiKey: String) async -> Result<String, Error> {
+        // 润色功能已移除，旧版本留下的润色配置不再测试
+        guard profile.role == .transcription else { return .failure(ServiceError.notConfigured("语音识别")) }
         do {
-            switch profile.role {
-            case .transcription:
-                // 发送 0.5 秒静音，只验证地址、Key 和模型 ID 是否可用
-                let silence = [Float](repeating: 0, count: 8_000)
-                let service = try TranscriptionService(profile: profile, apiKey: apiKey)
-                _ = try await service.transcribe(wav: WAVEncoder.encode(samples: silence))
-                return .success("连接成功")
-            case .polish:
-                let service = try PolishService(profile: profile, apiKey: apiKey)
-                let reply = try await service.complete(system: "只回复：好", user: "测试")
-                return .success("连接成功：\(reply.prefix(20))")
-            }
+            // 发送 0.5 秒静音，只验证地址、Key 和模型 ID 是否可用
+            let silence = [Float](repeating: 0, count: 8_000)
+            let resolved = try await LocalModelRuntimeManager.shared.prepare(profile)
+            let service = try TranscriptionService(profile: resolved, apiKey: apiKey)
+            _ = try await service.transcribe(wav: WAVEncoder.encode(samples: silence))
+            return .success("连接成功")
         } catch {
             return .failure(error)
         }

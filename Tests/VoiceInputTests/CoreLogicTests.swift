@@ -34,36 +34,65 @@ final class ChordStateMachineTests: XCTestCase {
     }
 }
 
-final class RuleCleanerTests: XCTestCase {
-    func testRemovesFillersAndRepeats() {
-        XCTAssertEqual(RuleCleaner.clean("嗯，我们再进行再进行一次测试"), "我们再进行一次测试")
-        XCTAssertEqual(RuleCleaner.clean("呃帮我写一个Python函数"), "帮我写一个 Python 函数")
+/// 实时模式分段拼接：只在两个英文单词之间补空格，中文不加任何字符
+final class TranscriptJoinerTests: XCTestCase {
+    private func join(_ pieces: [String]) -> String {
+        pieces.reduce("") { $0 + TranscriptJoiner.separator(between: $0, and: $1) + $1 }
     }
 
-    func testKeepsStandaloneFillerReply() {
-        XCTAssertEqual(RuleCleaner.clean("嗯嗯"), "嗯嗯")
+    func testChineseSegmentsAreConcatenatedAsIs() {
+        XCTAssertEqual(TranscriptJoiner.separator(between: "明天开会", and: "记得带电脑"), "")
+        XCTAssertEqual(TranscriptJoiner.separator(between: "明天开会。", and: "记得带电脑"), "")
+        XCTAssertEqual(join(["嗯，我们再进行", "再进行一次测试"]), "嗯，我们再进行再进行一次测试")
     }
 
-    func testKeepsDoubledSingleCharacters() {
-        XCTAssertEqual(RuleCleaner.clean("谢谢你，看看这个"), "谢谢你，看看这个")
+    func testMixedChineseAndEnglishAddNothing() {
+        XCTAssertEqual(TranscriptJoiner.separator(between: "帮我写一个", and: "Python函数"), "")
+        XCTAssertEqual(TranscriptJoiner.separator(between: "用Python", and: "写"), "")
+        XCTAssertEqual(TranscriptJoiner.separator(between: "這個軟體", and: "很好用"), "")
     }
 
-    func testConvertsTraditionalToSimplified() {
-        XCTAssertEqual(RuleCleaner.clean("這個軟體"), "这个软体")
+    func testEnglishWordsKeepSpace() {
+        XCTAssertEqual(TranscriptJoiner.separator(between: "hello", and: "world"), " ")
+        XCTAssertEqual(TranscriptJoiner.separator(between: "Hello.", and: "How are you"), " ")
+        XCTAssertEqual(TranscriptJoiner.separator(between: "hello ", and: "world"), "")
+        XCTAssertEqual(TranscriptJoiner.separator(between: "", and: "world"), "")
+    }
+}
+
+/// 按系统首选语言统一简繁
+final class ChineseScriptTests: XCTestCase {
+    func testUsesFirstChineseEntryInPreferredLanguages() {
+        // 界面语言是英文，但列表里有简体中文
+        XCTAssertEqual(ChineseScript.preferred(from: ["en-JP", "zh-Hans-JP", "ja-JP"]), .simplified)
+        XCTAssertEqual(ChineseScript.preferred(from: ["en-US", "zh-Hant-HK", "zh-Hans-CN"]), .traditional)
+        XCTAssertEqual(ChineseScript.preferred(from: ["zh-Hans-CN"]), .simplified)
+        XCTAssertEqual(ChineseScript.preferred(from: ["zh-Hant-TW"]), .traditional)
     }
 
-    func testDropsWhisperHallucinations() {
-        XCTAssertEqual(RuleCleaner.clean("谢谢观看！"), "")
-        XCTAssertEqual(RuleCleaner.clean("字幕由Amara.org社区提供"), "")
-        XCTAssertEqual(RuleCleaner.clean("Thank you"), "Thank you")
+    func testInfersScriptFromRegion() {
+        XCTAssertEqual(ChineseScript.preferred(from: ["zh-TW"]), .traditional)
+        XCTAssertEqual(ChineseScript.preferred(from: ["zh-HK"]), .traditional)
+        XCTAssertEqual(ChineseScript.preferred(from: ["zh-CN"]), .simplified)
+        XCTAssertEqual(ChineseScript.preferred(from: ["yue-Hant-HK"]), .traditional)
     }
 
-    func testSeparatorAndEnding() {
-        XCTAssertEqual(RuleCleaner.separator(between: "明天开会", and: "记得带电脑"), "，")
-        XCTAssertEqual(RuleCleaner.separator(between: "明天开会。", and: "记得带电脑"), "")
-        XCTAssertEqual(RuleCleaner.separator(between: "hello", and: "world"), " ")
-        XCTAssertEqual(RuleCleaner.finalizeEnding("明天开会", category: .document), "明天开会。")
-        XCTAssertEqual(RuleCleaner.finalizeEnding("明天开会", category: .chat), "明天开会")
+    func testNoChineseMeansNoConversion() {
+        XCTAssertNil(ChineseScript.preferred(from: ["en-US", "ja-JP"]))
+        XCTAssertNil(ChineseScript.preferred(from: []))
+    }
+
+    func testConvertsOnlyCharacterForms() {
+        XCTAssertEqual(ChineseScript.simplified.convert("為什麼現在他是识别到的内容"), "为什么现在他是识别到的内容")
+        XCTAssertEqual(ChineseScript.simplified.convert("嗯，這個軟體，OK嗎"), "嗯，这个软体，OK吗")
+        XCTAssertEqual(ChineseScript.traditional.convert("头发很长，后来我们发现了问题"), "頭髮很長，後來我們發現了問題")
+        XCTAssertEqual(ChineseScript.traditional.convert("嗯嗯我用Python写的"), "嗯嗯我用Python寫的")
+    }
+
+    func testLeavesNonChineseAndJapaneseUntouched() {
+        XCTAssertEqual(ChineseScript.simplified.convert("Hello world"), "Hello world")
+        XCTAssertEqual(ChineseScript.simplified.convert("日本語の勉強は楽しい"), "日本語の勉強は楽しい")
+        XCTAssertEqual(ChineseScript.simplified.convert("已经是简体"), "已经是简体")
     }
 }
 
@@ -97,26 +126,6 @@ final class WAVEncoderTests: XCTestCase {
         XCTAssertEqual(data.count, 44 + 32_000)
         XCTAssertEqual(String(decoding: data.prefix(4), as: UTF8.self), "RIFF")
         XCTAssertEqual(String(decoding: data[8..<12], as: UTF8.self), "WAVE")
-    }
-}
-
-final class PolishDeciderTests: XCTestCase {
-    private func context(_ category: AppCategory, replace: Bool = true) -> PolishContext {
-        PolishContext(category: category, dictionary: [], canReplaceInsertedText: replace)
-    }
-
-    func testSkipsShortCleanText() {
-        XCTAssertFalse(PolishDecider.needsModel("好的", context(.chat)))
-    }
-
-    func testCallsForCorrectionsAndLongText() {
-        XCTAssertTrue(PolishDecider.needsModel("三点，不对，四点", context(.chat)))
-        XCTAssertTrue(PolishDecider.needsModel("我想问一下明天的会议是在几点开始的呀", context(.general)))
-    }
-
-    func testRulesOnlyAppsAndNonReplaceableTargets() {
-        XCTAssertFalse(PolishDecider.needsModel("我想问一下明天的会议是在几点开始的呀", context(.code)))
-        XCTAssertFalse(PolishDecider.needsModel("我想问一下明天的会议是在几点开始的呀", context(.chat, replace: false)))
     }
 }
 
@@ -189,5 +198,142 @@ final class AutoConfigTests: XCTestCase {
         let profile = try JSONDecoder().decode(ModelProfile.self, from: Data(json.utf8))
         XCTAssertEqual(profile.model, "openai/whisper-large-v3-turbo")
         XCTAssertEqual(profile.role, .transcription)
+        XCTAssertEqual(profile.endpoint, .cloud)
+        XCTAssertTrue(profile.requiresAPIKey)
+    }
+}
+
+final class LocalModelScannerTests: XCTestCase {
+    func testScansGGMLModelAndIgnoresOtherFiles() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VoiceInput-Models-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let modelURL = root.appendingPathComponent("ggml-large-v3-q5_0.bin")
+        try makeGGMLFile(at: modelURL, audioState: 1280, audioLayers: 32, textLayers: 32, fileType: 6)
+
+        let unrelatedURL = root.appendingPathComponent("not-a-model.bin")
+        try Data(repeating: 0, count: 1_048_576).write(to: unrelatedURL)
+
+        let models = await LocalModelScanner.scan(roots: [root])
+        XCTAssertEqual(models.count, 1)
+        XCTAssertEqual(models.first?.name, "Whisper Large V3")
+        XCTAssertEqual(models.first?.quantization, "q5_0")
+        XCTAssertEqual(models.first?.multilingual, true)
+    }
+
+    func testLocalProfileAllowsEmptyAPIKey() throws {
+        let modelURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VoiceInput-Local-\(UUID().uuidString).bin")
+        try Data().write(to: modelURL)
+        defer { try? FileManager.default.removeItem(at: modelURL) }
+
+        let local = ModelProfile.localModel(name: "Whisper Large V3",
+                                            path: modelURL.path,
+                                            model: "ggml-large-v3-q5_0")
+        XCTAssertTrue(local.isLocal)
+        XCTAssertFalse(local.requiresAPIKey)
+        XCTAssertTrue(local.isReady(apiKey: ""))
+
+        var missingPath = local
+        missingPath.localModelPath = nil
+        XCTAssertFalse(missingPath.isReady(apiKey: ""))
+    }
+
+    func testWhisperServerArgumentsExposeOpenAIEndpoint() {
+        let arguments = LocalModelRuntimeManager.arguments(
+            for: URL(fileURLWithPath: "/tmp/ggml-large-v3-q5_0.bin"),
+            port: 18080
+        )
+        XCTAssertEqual(arguments, [
+            "--model", "/tmp/ggml-large-v3-q5_0.bin",
+            "--host", "127.0.0.1",
+            "--port", "18080",
+            "--inference-path", "/v1/audio/transcriptions",
+            "--language", "auto",
+        ])
+    }
+
+    @MainActor
+    func testLocalRuntimeStartsRealModelWhenEnabled() async throws {
+        guard ProcessInfo.processInfo.environment["VOICEINPUT_LOCAL_MODEL_TEST"] == "1" else {
+            throw XCTSkip("Set VOICEINPUT_LOCAL_MODEL_TEST=1 to run the real local-model integration test.")
+        }
+        let modelURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/whisper.cpp/ggml-large-v3-q5_0.bin")
+        guard FileManager.default.isReadableFile(atPath: modelURL.path) else {
+            throw XCTSkip("The shared large-v3 model is not installed.")
+        }
+
+        let profile = ModelProfile.localModel(name: "Whisper Large V3",
+                                              path: modelURL.path,
+                                              model: "ggml-large-v3-q5_0")
+        defer { LocalModelRuntimeManager.shared.stop() }
+
+        let resolved = try await LocalModelRuntimeManager.shared.prepare(profile)
+        XCTAssertTrue(resolved.baseURL.hasPrefix("http://127.0.0.1:"))
+        XCTAssertEqual(LocalModelRuntimeManager.shared.state, .running)
+
+        let service = try TranscriptionService(profile: resolved, apiKey: "")
+        _ = try await service.transcribe(
+            wav: WAVEncoder.encode(samples: [Float](repeating: 0, count: 8_000))
+        )
+    }
+
+    private func makeGGMLFile(at url: URL,
+                              audioState: UInt32,
+                              audioLayers: UInt32,
+                              textLayers: UInt32,
+                              fileType: UInt32) throws {
+        var data = Data(repeating: 0, count: 1_048_576)
+        func write(_ value: UInt32, at offset: Int) {
+            data[offset] = UInt8(value & 0xFF)
+            data[offset + 1] = UInt8((value >> 8) & 0xFF)
+            data[offset + 2] = UInt8((value >> 16) & 0xFF)
+            data[offset + 3] = UInt8((value >> 24) & 0xFF)
+        }
+        write(0x67676d6c, at: 0)
+        write(51_865, at: 4)
+        write(audioState, at: 12)
+        write(audioLayers, at: 20)
+        write(textLayers, at: 36)
+        write(fileType, at: 44)
+        try data.write(to: url)
+    }
+}
+
+/// 刘海悬停感应区：有刘海时就是刘海本身，没有刘海时是菜单栏正中间的一段
+final class NotchGeometryTests: XCTestCase {
+    func testNotchZoneIsTheNotchItself() {
+        // 14 英寸 MacBook Pro：1512 × 982，刘海约 185pt 宽、32pt 高
+        let frame = NSRect(x: 0, y: 0, width: 1512, height: 982)
+        let geometry = NotchGeometry(screenFrame: frame, visibleFrame: NSRect(x: 0, y: 0, width: 1512, height: 950),
+                                     hasNotch: true, notchWidth: 185, topHeight: 32)
+        XCTAssertEqual(geometry.hoverZone, NSRect(x: 756 - 92.5, y: 950, width: 185, height: 32))
+        XCTAssertTrue(geometry.hoverZoneContains(NSPoint(x: 756, y: 982)))     // 顶到最上沿
+        XCTAssertTrue(geometry.hoverZoneContains(NSPoint(x: 700, y: 960)))
+        XCTAssertFalse(geometry.hoverZoneContains(NSPoint(x: 600, y: 975)))    // 刘海左边的菜单栏
+        XCTAssertFalse(geometry.hoverZoneContains(NSPoint(x: 756, y: 940)))    // 刘海下方
+    }
+
+    func testFlatScreenUsesMenuBarCenter() {
+        // 外接显示器，位于主屏右侧，菜单栏 25pt
+        let frame = NSRect(x: 1512, y: 0, width: 1920, height: 1080)
+        let geometry = NotchGeometry(screenFrame: frame, visibleFrame: NSRect(x: 1512, y: 0, width: 1920, height: 1055),
+                                     hasNotch: false, notchWidth: 0, topHeight: 32)
+        XCTAssertEqual(geometry.hoverZone.width, NotchGeometry.flatZoneWidth)
+        XCTAssertEqual(geometry.hoverZone.height, 25)
+        XCTAssertTrue(geometry.hoverZoneContains(NSPoint(x: 1512 + 960, y: 1080)))
+        XCTAssertFalse(geometry.hoverZoneContains(NSPoint(x: 1512 + 700, y: 1070)))
+    }
+
+    func testAutoHiddenMenuBarKeepsUsableStrip() {
+        let frame = NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        let geometry = NotchGeometry(screenFrame: frame, visibleFrame: frame, hasNotch: false, notchWidth: 0, topHeight: 32)
+        XCTAssertEqual(geometry.hoverZone.height, NotchGeometry.minimumZoneHeight)
+        XCTAssertTrue(geometry.hoverZoneContains(NSPoint(x: 960, y: 1079)))
+        XCTAssertTrue(geometry.hoverZoneContains(NSPoint(x: 960, y: 1070)))
+        XCTAssertFalse(geometry.hoverZoneContains(NSPoint(x: 960, y: 1060)))
     }
 }

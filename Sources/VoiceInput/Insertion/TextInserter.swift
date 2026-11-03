@@ -9,22 +9,18 @@ final class TextInserter {
 
     private var clipboardBackup: [NSPasteboardItem]?
     private var ourChangeCount: Int?
-    /// 本次录音第一段文字写入前的光标位置（UTF-16），用于松手后整段替换
-    private var startLocation: Int?
     /// 本次录音已经写进去的全部文字
     private(set) var insertedText = ""
 
     func beginSession() {
         clipboardBackup = nil
         ourChangeCount = nil
-        startLocation = nil
         insertedText = ""
     }
 
     /// 写入一段文字。返回 nil 表示写入失败。
     func insert(_ text: String, into target: FocusTarget) -> Method? {
         guard !text.isEmpty, let element = target.element, !target.isSecure else { return nil }
-        if startLocation == nil, let range = AX.range(element) { startLocation = range.location }
 
         let method: Method
         if insertViaAccessibility(text, element: element) {
@@ -45,31 +41,6 @@ final class TextInserter {
             return true   // 读不到就不阻止（部分应用不支持系统级查询）
         }
         return CFEqual(current, element)
-    }
-
-    /// 能否把本次写入的文字整段替换成润色结果（设计文档 §13.5 的"终稿替换"校验）
-    func canReplaceInsertedText(in target: FocusTarget) -> Bool {
-        guard let element = target.element, let start = startLocation, !insertedText.isEmpty else { return false }
-        let length = insertedText.utf16.count
-        guard let current = AX.range(element), current.location == start + length, current.length == 0 else { return false }
-        return AX.string(element, in: CFRange(location: start, length: length)) == insertedText
-    }
-
-    /// 整段替换。任何一步失败都不改动用户的文字。
-    func replaceInsertedText(with newText: String, in target: FocusTarget) -> Bool {
-        guard newText != insertedText, canReplaceInsertedText(in: target),
-              let element = target.element, let start = startLocation else { return false }
-        let length = insertedText.utf16.count
-        guard AX.setRange(element, CFRange(location: start, length: length)) else { return false }
-        let ok = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, newText as CFString) == .success
-        let verified = ok && AX.string(element, in: CFRange(location: start, length: newText.utf16.count)) == newText
-        if !verified {
-            // 恢复光标到原来的位置
-            AX.setRange(element, CFRange(location: start + length, length: 0))
-            return false
-        }
-        insertedText = newText
-        return true
     }
 
     /// 录音结束：稍等目标应用读取完剪贴板，再恢复用户原来的剪贴板内容
