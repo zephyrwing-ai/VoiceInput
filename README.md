@@ -13,9 +13,15 @@ cd VoiceInput
 swift test                      # 单元测试（组合键、分段拼接、WAV、模型扫描、自动配置）
 ./scripts/build_app.sh          # 打包成 build/VoiceInput.app（ad-hoc 签名）
 OPEN=1 ./scripts/build_app.sh   # 打包并启动
+./scripts/dev_restart.sh        # 构建成功后替换正在运行的 App
+./scripts/dev_watch.sh          # 监听源码变化并自动构建、重启
 ```
 
 开发时也可以直接用 Xcode 打开 `Package.swift` 编辑代码。但麦克风权限要求 App 带有 Info.plist，所以运行时请使用脚本打出来的 `.app`。
+
+`dev_restart.sh` 只会在新 App 完成编译、打包、签名和校验后停止旧进程。构建失败时旧 App 继续运行。`dev_watch.sh` 监听 `Sources`、`Tests`、`Support`、`scripts` 和 `Package.swift`，合并连续保存后自动执行同一套重启流程。
+
+项目目录移动后，构建脚本会识别 `.build` 中的旧绝对路径并自动重置 SwiftPM 缓存。也可以运行 `FORCE_CLEAN=1 ./scripts/build_app.sh` 主动重置缓存。
 
 `Support/whisper-server` 是随 App 打包的静态 arm64 运行组件，打包脚本会把它复制到 `VoiceInput.app/Contents/Resources/` 并签名。模型权重放在用户目录，App 包只携带运行组件。
 
